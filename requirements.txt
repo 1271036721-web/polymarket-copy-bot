@@ -1,0 +1,5 @@
+requests>=2.31
+PyYAML>=6.0
+websocket-client>=1.8  # v2 用：RTDS + CLOB 市场推送
+# 实盘才需要：
+polymarket>=0.1

@@ -1,0 +1,11 @@
+# 构建上下文里不需要的东西（就算整个机器人目录被当作上下文也不怕）
+.venv/
+venv/
+__pycache__/
+*.pyc
+.git/
+*.log
+*.log.*
+*.bak-*
+state.json.bak-*
+.DS_Store

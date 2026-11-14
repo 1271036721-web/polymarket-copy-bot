@@ -1,0 +1,10 @@
+services:
+  copy-bot:
+    build: .
+    ports:
+      - "3000:3000"
+    volumes:
+      - copybot-data:/data
+
+volumes:
+  copybot-data:

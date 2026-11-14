@@ -1,0 +1,47 @@
+# Polymarket 跟单机器人 - 配置
+# 回测口径：2025-07 至 2026-11，1/20 跟，手续费 1.5%、滑点 1c 时
+# TruongMyLan 净 +$2,278 / royalestake +$5,576 / 0xC9BF +$25,613，合计 +$33,467
+# 0xC9BF 的利润 77% 来自 2026-10 一个月，别把回测当稳赚。
+# 默认 dry_run: true，只模拟、不真下单。实盘前先跑模拟盘至少 1 周。
+
+capital_usd: 10000.0        # 建议本金 $10,000；$7,500 最低，$5,000 很紧（活仓就占 $4,796）
+ratio: 0.05                  # 1/20 跟单比例
+poll_seconds: 5              # 每 5 秒查一次（2026-11-13 02:37 试跑 2 秒后 API 连续超时，已改回 5 秒）
+dry_run: true                # true=模拟盘，false=实盘。改 false 前必须先配好 .env
+
+# 风控：单笔、单市场、总仓位上限，超过就跳过
+max_per_trade_usd: 250.0     # 单笔最多 $250（$5,000 本金时按比例应再调低）
+max_per_token_usd: 500.0     # 同一个 outcome 累计最多 $500
+max_total_exposure_usd: 8000.0  # 总持仓成本最多 $8,000，留现金跟新单
+min_trade_usd: 5.0           # 小于 $5 的单跳过，滑点和手续费吃掉
+max_slippage: 0.10           # 2026-11-15 Dylan 决定：滑点保护加回来，现价比目标贵 10 美分以上就跳过（之前 1.0 是 2026-11-13 的“不跳滑点直接跟”，导致一批 $0.99 假价成交）
+max_price: 0.97              # 价格 >0.97 不跟（已基本定胜负）
+min_price: 0.03              # 价格 <0.03 不跟
+
+# 跟单目标：我们在 2026-11-13 筛出来的 3 个方向性钱包
+# 注意：排行榜 PnL 是最近一段、不是全-time，前 3 名全-time 其实是亏几百万的，
+# 这 3 个是按全-time、胜率、单笔集中度筛过的。
+targets:
+  - name: TruongMyLan
+    address: "0x69788e136500902559a2fb21883ab9baacbd08d8"
+    note: "长期单为主，2025-07 起 +$136,212，均笔 $227，最稳"
+  - name: royalestake
+    address: "0xfb681e23db8d1cca8a6b7e2a70a29e000ddfa240"
+    note: "NHL 为主，+$229,803，均笔 $166，最分散；最近 30 天在亏"
+  - name: "0xC9BF"
+    address: "0xc9bfc7986767173b4f1c3fc9b2c6b255fc7381c0"
+    note: "只做 CS2，+$558,049，但 94% 利润来自 2026-10 一个月，11 月净利已转负"
+
+# 跳过这些市场（15 分钟 BTC 做市盘跟不了，见 2026-11-13 的分析）
+skip_title_contains:
+  - "Bitcoin Up or Down"
+  - "Ethereum Up or Down"
+
+# 只跟 BUY。SELL 只有在我们持有同一 token 时才按比例卖出（止盈/止损退出），
+# 不做空、不跟他们卖出开仓。
+follow_sell_only_if_holding: true
+
+data_api_base: "https://data-api.polymarket.com/v2"
+clob_price_base: "https://clob.polymarket.com"
+state_file: "state.json"
+log_file: "copy_trades.csv"
