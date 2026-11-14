@@ -242,8 +242,20 @@ class Bot:
         if not tx or tx in self.state["seen_tx"]:
             return False
         self.state["seen_tx"].append(tx)
+        if act.get("side") == "SELL":
+            # 跟卖（2026-11-15 Dylan 决定）：目标卖出时按相同比例卖出我们持有的
+            # 对应仓位（只减该目标名下的份额），不再死扛到结算。
+            if not CFG.get("follow_sell_only_if_holding", True):
+                return True
+            if str(target.get("address", "")).lower() not in TARGETS_BY_ADDR:
+                return True  # 已停跟的目标（如 0xC9BF）的卖单直接忽略
+            try:
+                self.process_sell(target, act)
+            except Exception as e:
+                log(f"  跟卖处理异常 {target['name']} {str(act.get('title', ''))[:30]}: {e}")
+            return True
         if act.get("side") != "BUY":
-            return True  # SELL 也记 seen，但不进待处理池
+            return True  # 其他 side 不处理
         title = act.get("title", "")
         if any(bad in title for bad in CFG.get("skip_title_contains", [])):
             return True
@@ -287,6 +299,171 @@ class Bot:
             "size": size,
             "usdc_size": price * size,
         }
+
+    # ---------- 跟卖（2026-11-15 Dylan 决定：目标卖出时按比例跟卖） ----------
+    # 触发点：ingest_act 收到 SELL 就同步调 process_sell（RTDS 事件和兜底轮询
+    # 都在主线程调 ingest_act，所以这里可以直接做 HTTP 查仓，不用再排队）。
+    # 卖出比例 = 目标本次卖出份额 / 目标卖出前该 token 总持仓份额
+    # （卖出前总量 = 查到的剩余份额 + 本次卖出份额；目标已全出时剩余为 0，
+    # 比例就是 1.0，我们名下那份全卖）。卖出不设滑点跳过保护：目标要出场
+    # 这个信号本身比价格重要，按当前价直接镜像卖出。
+    def fetch_target_position_size(self, address, token_id):
+        """查目标在该 token 上的剩余持仓份额（Data API /v2/positions）。
+        返回 float（没有持仓返回 0.0）；查不到/失败返回 None（调用方跳过本次卖出）。"""
+        try:
+            d = self.get_json(
+                f"{CFG['data_api_base']}/positions?user={address}&limit=500", timeout=10
+            )
+        except Exception as e:
+            log(f"  跟卖查目标持仓失败: {e}")
+            return None
+        for row in d.get("data", []):
+            if str(row.get("token_id", "")) == str(token_id):
+                try:
+                    return float(row.get("current_size", row.get("total_size", 0)) or 0)
+                except (TypeError, ValueError):
+                    return 0.0
+        return 0.0
+
+    def target_attribution(self, token, target_name):
+        """该目标在我们这笔持仓里的份额：返回 (attributable_size, cost_share)。
+        持仓自带 target 字段的直接认；老持仓没有 target 的，按 copy_trades.csv
+        里 (title, outcome) 的买入金额占比分摊。"""
+        pos = self.state["positions"].get(str(token))
+        if not pos:
+            return 0.0, 0.0
+        owner = pos.get("target") or ""
+        if owner == target_name:
+            return float(pos["size"]), 1.0
+        if owner:
+            return 0.0, 0.0  # 整个持仓属于另一个目标
+        # 老持仓：按买入金额分摊
+        total = 0.0
+        mine = 0.0
+        try:
+            with open(self.log_file, newline="") as f:
+                for row in csv.DictReader(f):
+                    if row.get("title") == pos["title"] and row.get("outcome") == pos["outcome"]:
+                        amt = float(row.get("amount_usd") or 0)
+                        total += amt
+                        if row.get("target") == target_name:
+                            mine += amt
+        except Exception as e:
+            log(f"  跟卖归属读取 copy_trades.csv 失败: {e}")
+            return 0.0, 0.0
+        if total <= 0 or mine <= 0:
+            return 0.0, 0.0
+        share = mine / total
+        return float(pos["size"]) * share, share
+
+    def live_sell(self, token_id, amount_usd):
+        """实盘卖出（与 live_buy 对称；dry_run=true 时不调用）。"""
+        try:
+            from polymarket import AsyncSecureClient
+            import asyncio
+        except ImportError:
+            log("  实盘需要 pip install polymarket，先装好再开实盘")
+            return None
+        pk = os.environ.get("POLYMARKET_PRIVATE_KEY")
+        wallet = os.environ.get("POLYMARKET_WALLET_ADDRESS")
+        if not pk or not wallet:
+            log("  缺 POLYMARKET_PRIVATE_KEY / POLYMARKET_WALLET_ADDRESS，跳过实盘")
+            return None
+
+        async def _sell():
+            client = await AsyncSecureClient.create(private_key=pk, wallet=wallet)
+            resp = await client.place_market_order(
+                asset_id=str(token_id), side="SELL", amount=str(round(amount_usd, 2))
+            )
+            return resp
+
+        try:
+            resp = asyncio.run(_sell())
+            if getattr(resp, "ok", False):
+                return resp.order_id
+            log(f"  实盘卖出失败: {getattr(resp, 'message', resp)}")
+            return None
+        except Exception as e:
+            log(f"  实盘卖出异常: {e}")
+            return None
+
+    def append_sell(self, row):
+        """卖出记账：单独记 copy_sells.csv（copy_trades.csv 保持 11 列买入口径不变，
+        已有的分析脚本不受影响）。卖出文件跟 --log-file 走，和 copy_trades.csv
+        放同一目录（测试时指向副本，不会写线上文件）。"""
+        sell_file = self.log_file.parent / "copy_sells.csv"
+        exists = sell_file.exists()
+        with open(sell_file, "a", newline="") as f:
+            w = csv.DictWriter(f, fieldnames=list(row.keys()))
+            if not exists:
+                w.writeheader()
+            w.writerow(row)
+
+    def process_sell(self, target, act):
+        """目标卖出 -> 按相同比例卖出我们持有的对应仓位（只减该目标名下的份额）。"""
+        name = target["name"]
+        token = str(act.get("token_id", ""))
+        title = act.get("title", "")
+        pos = self.state["positions"].get(token)
+        if not pos:
+            log(f"{name} 卖出 {title[:40]} {act.get('outcome')} -> 忽略：未持有该 token")
+            return
+        attr_size, share = self.target_attribution(token, name)
+        if attr_size <= 0:
+            log(f"{name} 卖出 {title[:40]} {act.get('outcome')} -> 忽略：该持仓不属于 {name}")
+            return
+        sell_size = float(act.get("size") or 0)
+        if sell_size <= 0:
+            return
+        remaining = self.fetch_target_position_size(target["address"], token)
+        if remaining is None:
+            log(f"{name} 卖出 {title[:40]} -> 跳过：查不到目标持仓")
+            return
+        total_before = remaining + sell_size
+        fraction = (sell_size / total_before) if total_before > 0 else 1.0
+        fraction = min(max(fraction, 0.0), 1.0)
+        # 全出（或接近全出）就把我们名下那份全卖了，不留碎屑
+        if fraction >= 0.999:
+            our_size = attr_size
+            fraction = 1.0
+        else:
+            our_size = attr_size * fraction
+        now, src = self.price(token, act.get("slug", ""), act.get("outcome_index"))
+        if now is None:
+            log(f"{name} 卖出 {title[:40]} -> 跳过：取不到现价")
+            return
+        value = our_size * now
+        if value < 0.50 and fraction < 1.0:
+            log(f"{name} 卖出 {title[:40]} -> 跳过：跟卖金额太小 ${value:.2f}（目标仓位 {fraction:.1%}）")
+            return
+        attr_cost = pos["cost"] * share
+        cost_basis = attr_cost * (our_size / attr_size) if attr_size else 0.0
+        target_price = float(act.get("price") or 0)
+        ts = datetime.fromtimestamp(act.get("timestamp") or int(time.time()), tz=timezone.utc).strftime("%m-%d %H:%M")
+        order_id = None
+        if not self.dry_run:
+            order_id = self.live_sell(token, value)
+            if order_id is None:
+                log(f"{name} {ts} 实盘卖出失败，跳过")
+                return
+        pnl = value - cost_basis
+        pos["size"] -= our_size
+        pos["cost"] -= cost_basis
+        if pos["size"] <= 0.01 or pos["cost"] <= 0.01:
+            del self.state["positions"][token]
+        self.state["cash"] += value
+        self.state["sells"] = self.state.get("sells", 0) + 1
+        self.save_state()
+        tag = "模拟" if self.dry_run else f"实盘 {order_id}"
+        log(f"{name} {ts} [{tag}] 跟卖 {title[:45]} {act.get('outcome')} ${value:.2f} @现价 ${now:.2f}（{src}，目标卖价 ${target_price:.2f}，目标仓位 {fraction:.1%}） 盈亏 ${pnl:+.2f} 现金剩 ${self.state['cash']:.0f}")
+        self.append_sell({
+            "time_utc": datetime.now(timezone.utc).isoformat(),
+            "target": name, "target_tx": act.get("transaction_hash", ""), "title": title,
+            "outcome": act.get("outcome", ""), "target_price": round(target_price, 4),
+            "exec_price": now, "amount_usd": round(value, 2),
+            "size": round(our_size, 2), "dry_run": self.dry_run, "order_id": order_id or "",
+            "frac_of_target_position": round(fraction, 4), "pnl": round(pnl, 2),
+        })
 
     # ---------- 处理待处理池（v1 run_once 第 2 步） ----------
     def process_pending(self):
@@ -444,7 +621,7 @@ class Bot:
                 ws = websocket.create_connection(RTDS_URL, timeout=15)
                 log("RTDS: 已连接 wss://ws-live-data.polymarket.com")
                 ws.send(json.dumps({"action": "subscribe", "subscriptions": [{"topic": "activity", "type": "trades"}]}))
-                log("RTDS: 已订阅 activity/trades（全量推送，本地按 3 个钱包过滤）")
+                log(f"RTDS: 已订阅 activity/trades（全量推送，本地按 {len(TARGETS_BY_ADDR)} 个钱包过滤）")
                 backoff = 1
                 self.backfill_needed.set()  # （重）连上先补漏一次
                 last_ping = 0.0
@@ -675,7 +852,7 @@ class Bot:
             f"CLOB WS 收到 {self.stats['clob_msgs']} 条、重连 {self.stats['clob_reconnects']} 次、"
             f"现价缓存命中 {self.stats['price_cache_hits']} 次、HTTP 回退 {self.stats['price_http_fallbacks']} 次、"
             f"兜底轮询 {self.stats['poll_cycles']} 轮、拉取失败 {self.stats['poll_errors']} 次、"
-            f"现金 ${self.state['cash']:.2f}、持仓 {len(self.state['positions'])} 个、已跟 {self.state['trades']} 笔")
+            f"现金 ${self.state['cash']:.2f}、持仓 {len(self.state['positions'])} 个、已跟 {self.state['trades']} 笔、已卖 {self.state.get('sells', 0)} 笔")
 
 
 def main():
