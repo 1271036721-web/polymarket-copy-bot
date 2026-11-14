@@ -497,6 +497,15 @@ class Bot:
                 log(f"{name} {ts} {p['title'][:45]} -> 跳过：取不到现价")
                 continue
             target_price = float(act["price"] or 0)
+            if now < CFG["min_price"] or now > CFG["max_price"]:
+                log(f"{name} {ts} {p['title'][:45]} {p['outcome']} 目标 ${target_price:.2f} 现价 ${now:.2f}（{src}）超出 [{CFG['min_price']}-{CFG['max_price']}] -> 跳过")
+                continue
+            if target_price - now > CFG["max_slippage"]:
+                # 2026-11-15 换目标部署时发现：补漏轮询会跟进几小时前的旧单，Dota 这种
+                # 快结算的市场现价已跌到 $0.001/$0.017（目标买在 $0.52/$0.23），等于买已
+                # 定胜负的单子。旧的上滑点保护只拦“现价比目标贵”，现价跌穿目标价也要拦。
+                log(f"{name} {ts} {p['title'][:45]} {p['outcome']} 目标 ${target_price:.2f} 现价 ${now:.2f}（{src}） 跌穿 {target_price-now:.2f} > {CFG['max_slippage']} -> 跳过")
+                continue
             if now - target_price > CFG["max_slippage"]:
                 log(f"{name} {ts} {p['title'][:45]} {p['outcome']} 目标 ${target_price:.2f} 现价 ${now:.2f}（{src}） 滑点 {now-target_price:.2f} > {CFG['max_slippage']} -> 跳过")
                 continue
