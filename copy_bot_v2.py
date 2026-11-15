@@ -170,6 +170,27 @@ class Bot:
         p = self.current_price_http(token_id, market_slug, outcome_index)
         return p, "http"
 
+    def sell_price(self, token_id, target_price, market_slug="", outcome_index=None):
+        """卖出取价（带校验）：WS 缓存价先对目标卖价，偏离超过 max_slippage
+        （默认 0.10）就不可信——CLOB WS 的 ask 偶尔会卡在 $0.99 的假价，
+        之前买入已坑过几次，2026-11-15 卖出也中招（目标卖 $0.29，WS 给 $0.99）。
+        目标卖价是目标真实成交价，是最可信的锚。顺序：WS 价（偏差 <=0.10 直接用）
+        -> HTTP 价（prices-history/Gamma，偏差 <=0.10 用）-> 目标卖价兜底。
+        目标卖价缺失时不校验，直接用原价。返回 (price, source)。"""
+        now, src = self.price(token_id, market_slug, outcome_index)
+        if now is None:
+            return None, "none"
+        if not target_price:
+            return now, src
+        if abs(now - target_price) <= CFG["max_slippage"]:
+            return now, src
+        http_p = self.current_price_http(token_id, market_slug, outcome_index)
+        if http_p is not None and abs(http_p - target_price) <= CFG["max_slippage"]:
+            log(f"  卖出取价：WS 价 ${now:.2f}（{src}）偏离目标卖价 ${target_price:.2f} 超过 {CFG['max_slippage']}，改用 HTTP 价 ${http_p:.2f}")
+            return http_p, "http"
+        log(f"  卖出取价：WS 价 ${now:.2f}（{src}）/ HTTP 价 {http_p} 均偏离目标卖价 ${target_price:.2f} 超过 {CFG['max_slippage']}，改用目标卖价")
+        return target_price, "target-price"
+
     # ---------- 实盘下单（与 v1 相同，dry_run 时不调用） ----------
     def live_buy(self, token_id, amount_usd):
         try:
@@ -428,7 +449,8 @@ class Bot:
             fraction = 1.0
         else:
             our_size = attr_size * fraction
-        now, src = self.price(token, act.get("slug", ""), act.get("outcome_index"))
+        target_price = float(act.get("price") or 0)
+        now, src = self.sell_price(token, target_price, act.get("slug", ""), act.get("outcome_index"))
         if now is None:
             log(f"{name} 卖出 {title[:40]} -> 跳过：取不到现价")
             return
@@ -438,7 +460,6 @@ class Bot:
             return
         attr_cost = pos["cost"] * share
         cost_basis = attr_cost * (our_size / attr_size) if attr_size else 0.0
-        target_price = float(act.get("price") or 0)
         ts = datetime.fromtimestamp(act.get("timestamp") or int(time.time()), tz=timezone.utc).strftime("%m-%d %H:%M")
         order_id = None
         if not self.dry_run:
