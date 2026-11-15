@@ -22,6 +22,8 @@ v2 的三层结构：
 其余逻辑与 v1 完全相同，可直接接管 v1 的 state.json / copy_trades.csv：
   - 碎单聚合：按 (目标, token) 累计，折合 >= $5 或满 600 秒才处理一次
   - decide() 风控、2 美分滑点保护、市价跟单、dry_run 记账
+  - V7 宽松门槛（2026-11-16 Dylan 决定）：赔率 1.15–2.50、U3 每天同类型
+    2 场、否决清单（v7_veto.json）；只拦 BUY，cannot_score 类型放行
   - seen_tx 去重（RTDS 和轮询走同一条 ingest，同一 tx 只处理一次）
   - 两个 WS 断线后指数退避重连，重连成功立即拉一次 activity 补漏
 
@@ -53,6 +55,16 @@ except ImportError:
 BASE = Path(__file__).parent
 CFG = yaml.safe_load((BASE / "config.yaml").read_text())
 
+# V7 宽松门槛用的分类器：复用 v7_observe.py 的 classify / market_type_of，
+# 保证门槛和观察打分是同一套口径（import 本身无副作用，只有函数/常量定义）。
+# 导入失败时降级为 fail-open（v7_gate 直接放行，不拦单）。
+try:
+    sys.path.insert(0, str(BASE))
+    from v7_observe import classify as v7_classify, market_type_of as v7_market_type_of
+except Exception:
+    v7_classify = None
+    v7_market_type_of = None
+
 # v2 可调参数（config.yaml 里没有就用默认值，不改动 config.yaml）
 RTDS_URL = CFG.get("rtds_url", "wss://ws-live-data.polymarket.com")
 CLOB_WS_URL = CFG.get("clob_ws_url", "wss://ws-subscriptions-clob.polymarket.com/ws/market")
@@ -60,6 +72,13 @@ SAFETY_POLL_SECONDS = CFG.get("v2_safety_poll_seconds", 15)  # 兜底并行轮�
 PRICE_CACHE_MAX_AGE = CFG.get("v2_price_cache_max_age", 10)  # 现价缓存新鲜度（秒）
 SETTLE_INTERVAL_SECONDS = CFG.get("v2_settle_interval_seconds", 600)  # 自动结算间隔（秒）
 SETTLE_MIN_AGE_SECONDS = CFG.get("v2_settle_min_age_seconds", 300)  # 结算价至少 5 分钟前才认，避免瞬时坏价
+
+# V7 宽松门槛（2026-11-16 Dylan 决定：加上 V7 过滤，但放宽松一点）
+# 只拦 BUY，不拦 SELL（V7 是买入模型；卖出有 sell_price 校验）。
+V7_ODDS_LOW = 1.15    # 隐含赔率下限（1/现价）
+V7_ODDS_HIGH = 2.50   # 隐含赔率上限
+V7_U3_MAX_PER_DAY = 2  # 同一天（UTC）同一目标同一盘口类型最多跟 2 个不同市场
+VETO_FILE = BASE / "v7_veto.json"  # 否决清单，v7_observe.py update_vetoes 维护
 
 TARGETS_BY_ADDR = {t["address"].lower(): t for t in CFG["targets"]}
 TARGET_ADDRS_LOWER = list(TARGETS_BY_ADDR.keys())
@@ -486,6 +505,73 @@ class Bot:
             "frac_of_target_position": round(fraction, 4), "pnl": round(pnl, 2),
         })
 
+    # ---------- V7 宽松门槛（2026-11-16 Dylan 决定；只拦 BUY） ----------
+    def load_vetoes(self):
+        """读否决清单（v7_observe.py update_vetoes 维护）。
+        文件不存在/损坏时当作空清单，不报错、不拦单。"""
+        try:
+            d = json.loads(VETO_FILE.read_text())
+            if isinstance(d, dict):
+                return d.get("vetoes", []) or []
+        except Exception:
+            pass
+        return []
+
+    def v7_u3_count(self, target_name, market_type):
+        """今天（UTC）copy_trades.csv 里该目标该盘口类型已跟过的不同市场数。
+        同一市场的多笔碎单只算 1 个。文件不存在/读失败按 0 计（放行）。"""
+        today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+        seen = set()
+        try:
+            with open(self.log_file, newline="") as f:
+                for row in csv.DictReader(f):
+                    if row.get("target") != target_name:
+                        continue
+                    if not (row.get("time_utc") or "").startswith(today):
+                        continue
+                    if v7_market_type_of is None:
+                        return 0
+                    if v7_market_type_of(row.get("title", "")) != market_type:
+                        continue
+                    seen.add((row.get("title", ""), row.get("outcome", "")))
+        except Exception:
+            return 0
+        return len(seen)
+
+    def v7_gate(self, target_name, title, outcome, now):
+        """宽松版 V7 门槛（只拦 BUY；SELL 不走这里）。
+        返回 "" 表示放行，否则返回跳过原因（调用方记日志）。
+        顺序：否决清单 -> cannot_score 类型放行 -> 赔率窗 -> U3。
+        - 否决清单：(target, market_type) 在 v7_veto.json 里就拦。
+        - cannot_score：电竞盘中单局胜负（Dota 2 Game/Map N Winner 这类）
+          没有局内信息算不出概率，观察里记 cannot_score，这里直接放行。
+        - 赔率窗：隐含赔率 1/now 在 1.15–2.50 外就拦；只对 V7 能打分的
+          运动生效（not_applicable 的非体育目标直接放行；标题没带运动
+          关键词的 unknown_sport 仍走赔率窗——框架覆盖足球/篮球/UFC 等，
+          观察打分也是先查 Gamma 定运动再打分）。
+        - U3：同一天（UTC）同一目标同一盘口类型已跟 2 个不同市场，第 3 个拦。
+        分类器复用 v7_observe.py 的 classify / market_type_of（同一套口径）；
+        分类器不可用时 fail-open 放行。"""
+        if v7_classify is None or v7_market_type_of is None:
+            return ""
+        kind, sport, sport_name, mt, hint = v7_classify(
+            {"target": target_name, "title": title})
+        for v in self.load_vetoes():
+            if v.get("target") == target_name and v.get("market_type") == mt:
+                return f"V7 门槛：否决清单 {target_name}|{mt}（自 {v.get('since', '')}）-> 跳过"
+        if kind == "not_applicable":
+            return ""
+        if sport == "esports" and mt == "单局胜负":
+            return ""
+        if now and now > 0:
+            odds = 1.0 / now
+            if odds < V7_ODDS_LOW or odds > V7_ODDS_HIGH:
+                return f"V7 门槛：赔率 {odds:.2f} 在 1.15–2.50 窗外 -> 跳过"
+        n = self.v7_u3_count(target_name, mt)
+        if n >= V7_U3_MAX_PER_DAY:
+            return f"V7 门槛：U3 今日 {target_name} {mt} 已跟 {n} 场 -> 跳过"
+        return ""
+
     # ---------- 处理待处理池（v1 run_once 第 2 步） ----------
     def process_pending(self):
         new = 0
@@ -509,13 +595,18 @@ class Bot:
                    "usdc_size": target_usdc,
                    "price": (target_usdc / p["size_total"] if p["size_total"] else 0)}
             ts = datetime.fromtimestamp(p["first_ts"], tz=timezone.utc).strftime("%m-%d %H:%M")
-            amount, skip = self.decide(target, act)
-            if skip:
-                log(f"{name} {ts} {p['title'][:45]} {p['outcome']} 目标合计 ${target_usdc:.0f}（{len(p['txs'])} 笔碎单）-> 跳过：{skip}")
-                continue
+            # 现价先取：V7 宽松门槛要用现价算隐含赔率，且门槛要在 decide() 之前跑
             now, src = self.price(p["token_id"], p["slug"], p["outcome_index"])
             if now is None:
                 log(f"{name} {ts} {p['title'][:45]} -> 跳过：取不到现价")
+                continue
+            gate_reason = self.v7_gate(name, p["title"], p["outcome"], now)
+            if gate_reason:
+                log(f"{name} {ts} {p['title'][:45]} {p['outcome']} 目标合计 ${target_usdc:.0f}（{len(p['txs'])} 笔碎单）-> 跳过：{gate_reason}")
+                continue
+            amount, skip = self.decide(target, act)
+            if skip:
+                log(f"{name} {ts} {p['title'][:45]} {p['outcome']} 目标合计 ${target_usdc:.0f}（{len(p['txs'])} 笔碎单）-> 跳过：{skip}")
                 continue
             target_price = float(act["price"] or 0)
             if now < CFG["min_price"] or now > CFG["max_price"]:
