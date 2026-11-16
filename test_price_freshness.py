@@ -71,6 +71,10 @@ class FakeGamma:
         self.calls.append(url)
         if "clob.polymarket.com" in url:
             return {"error": "Invalid token id"}
+        if "prices-history" in url:
+            # This suite predates the 5th (history) layer: no trades in the
+            # window -> fail open with warning, as on illiquid markets.
+            return {"data": []}
         if "/events/slug/" in url:
             return {"markets": [{
                 "slug": self.slug,

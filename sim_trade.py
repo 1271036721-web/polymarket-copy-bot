@@ -43,6 +43,11 @@ V7 门槛、观察打分）永远不碰它们；机器人 settle_positions() 会
       /events 两个端点价差 > 0.03、现价与 V7 评估价偏离 > 0.05，任一成立
       就拒单。实测：直播市场 updatedAt 也会滞后 2-4 分钟，60 秒阈值会误杀
       正常买入，故时效阈值放宽到 10 分钟，主防线是评估价偏离校验。
+  (e) 买入价须与真实成交交叉验证（2026-11-16 Hemery 事故后新增：Gamma
+      0.64 买入时最近成交已 0.945，评估价 0.635 与买入价同源滞后，前四层
+      全过）：Gamma 价与最近 5 分钟最后一笔成交价（data-api prices-history）
+      偏离 > 0.05 就拒单；5 分钟内无成交或取价失败时放行（记警告），不误杀
+      低流动性市场的正常买入。成交价只做否决，绝不用作买入价。
   卖出不受影响：卖出永远不跳过，取不到价仍用 prices-history 兜底。
 
 退出触发（exit-check）：
@@ -102,6 +107,9 @@ FRESH_JUMP_TOL = 0.03       # 两次取价相差超过 0.03 视为价格跳变
 FRESH_RECHECK_DELAY_S = 2.0  # 两次取价间隔（秒）
 FRESH_EVENT_TOL = 0.03      # /markets 与 /events 同一市场价差超过 0.03 视为数据不一致
 EVAL_DIVERGE_TOL = 0.05     # 买入现价与 V7 评估价（--price）偏离超过 0.05，评估已过期
+# --- 买入价 prices-history 交叉校验（2026-11-16 Hemery 事故后新增，见 history_cross_check） ---
+HISTORY_WINDOW_S = 300      # 交叉校验窗口：最近 5 分钟内的最后一笔成交
+HISTORY_DEVIATE_TOL = 0.05  # Gamma 价与最近成交价偏离超过 0.05 视为快照滞后，拒单
 KELLY_MAX = 0.25          # Quarter Kelly  fraction 合理上限，防单位传错（如传 14 而不是 0.14）
 SETTLE_MIN_AGE = 300      # 结算价至少 5 分钟前才认（与机器人同款）
 LOCK_TIMEOUT = 15.0
@@ -362,13 +370,43 @@ def fresh_gamma_ask(slug, outcome_index, delay=FRESH_RECHECK_DELAY_S):
     return p2, "gamma-fresh"
 
 
+def history_cross_check(token_id, price):
+    """买入侧 prices-history 交叉校验（第 5 层，2026-11-16 Hemery 事故后新增）。
+    Gamma 会在快速波动的低流动性市场滞后于真实成交：Hemery 一单 Gamma
+    0.64，买入时最近成交已 0.945（偏离 0.305）；Nardi 一单 Gamma 0.5005，
+    最近成交 0.677（偏离 0.177）。四层 Gamma-only 校验全过，因为 V7
+    评估价和买入价来自同一个滞后 feed——只有真实成交能戳穿它。
+    与最近 HISTORY_WINDOW_S（5 分钟）内最后一笔成交价比对，偏离 >
+    HISTORY_DEVIATE_TOL（0.05）就拒单。0.05 与 EVAL_DIVERGE_TOL 对齐：
+    系统本来就把 0.05 的跑价视为“评估已过期”；两起事故的最小偏离
+    0.081（Nardi 对 5 分钟内任一成交点），阈值留有 1.6 倍余量。
+    注意：这里 prices-history 只做交叉否决，绝不用作买入价——买入价
+    仍只来自 CLOB/Gamma 实时报价。
+    5 分钟内无成交、或取价失败时 FAIL OPEN（记警告，不阻塞）：流动性差
+    的市场本来就没有近期成交，拦了会误杀正常买入；四层 Gamma 校验仍在。
+    返回 (ok, reason)，reason 只在拒单时为 'history-deviated'。"""
+    hist, _ts = history_last_price(token_id, window=HISTORY_WINDOW_S)
+    if hist is None:
+        log("  取价：近 5 分钟无成交，prices-history 交叉校验跳过（警告）")
+        return True, ""
+    if abs(price - hist) > HISTORY_DEVIATE_TOL:
+        log(f"  取价：Gamma ${price:.3f} 与最近成交 ${hist:.3f} "
+            f"偏离 > {HISTORY_DEVIATE_TOL}，疑似快照滞后，不买")
+        return False, "history-deviated"
+    return True, ""
+
+
 def fresh_ask_price(token_id, slug="", outcome_index=None, eval_price=None,
                     delay=FRESH_RECHECK_DELAY_S):
     """买入用新鲜可成交价：CLOB book 为主（目前恒失败，返回 Invalid token id），
     Gamma 走 fresh_gamma_ask 四层新鲜校验；再与 V7 评估价（--price）比对，
-    偏离 > EVAL_DIVERGE_TOL（0.05）说明评估时的价格已过期——Nardi 一单：
-    评估 0.5835，买入快照 0.5005，偏离 0.083，本应拒单。返回 (price, source)
-    或 (None, 原因)。这是买入侧的“价格跑掉”检查，与推送侧的复核同款逻辑，
+    偏离 > EVAL_DIVERGE_TOL（0.05）说明评估时的价格已过期；最后用
+    prices-history 交叉校验（第 5 层）：Gamma 价与最近 5 分钟成交价偏离
+    > 0.05 说明 Gamma feed 本身滞后——Nardi 一单：
+    评估 0.5835，买入快照 0.5005，偏离 0.083，本应拒单；Hemery 一单：
+    评估 0.635、快照 0.64 都来自滞后 feed，前四层全过，只有成交价
+    0.945 能戳穿（偏离 0.305）。返回 (price, source) 或 (None, 原因)。
+    这是买入侧的“价格跑掉”检查，与推送侧的复核同款逻辑，
     只是在执行前就拦住，不用等推送复核才发现（原来流程是先买后复核）。"""
     ask = clob_ask(token_id)
     g, gsrc = None, None
@@ -391,6 +429,9 @@ def fresh_ask_price(token_id, slug="", outcome_index=None, eval_price=None,
         log(f"  取价：现价 ${ask:.3f} 与 V7 评估价 ${float(eval_price):.3f} "
             f"偏离 > {EVAL_DIVERGE_TOL}，评估已过期，不买")
         return None, "eval-diverged"
+    ok, hsrc = history_cross_check(token_id, ask)
+    if not ok:
+        return None, hsrc
     return ask, src
 
 
@@ -492,8 +533,11 @@ def cmd_buy(a):
     # 买前重新取实时可成交价，按 V7 价格保护：(a) 不高于本单的不再追上限；
     # (b) U2：按现价算 Edge > 0；(c) U1：取不到实时可成交价就不买；
     # (d) 新鲜校验（2026-11-16 19:42 事故后新增）：Gamma 快照过期/跳变/
-    #     端点不一致/与 V7 评估价偏离 > 0.05 都拒单——这就是推送侧“价格跑掉
-    #     不推”在执行前的版本，原来先买后复核的顺序漏洞就堵在这里。
+    #     端点不一致/与 V7 评估价偏离 > 0.05 都拒单；(e) 成交交叉校验
+    #     （2026-11-16 Hemery 事故后新增）：Gamma 价与最近 5 分钟成交价
+    #     偏离 > 0.05 也拒单——评估价与买入价同源滞后时只有成交价能戳穿。
+    #     这就是推送侧“价格跑掉不推”在执行前的版本，原来先买后复核的顺序
+    #     漏洞就堵在这里。
     ask, src = fresh_ask_price(token, a.slug, a.outcome_index, eval_price=a.price)
     if ask is None:
         return fail(f"买入价校验不过（{src}），按 U1 不买")
