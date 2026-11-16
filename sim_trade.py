@@ -606,6 +606,52 @@ def cmd_sell(a):
 
 
 # ---------- 结算（机器人同款规则，只结 V7-SELF 仓位） ----------
+SETTLE_NEAR = 0.99  # 近结算价阈值：最后一笔 >=0.99/<=0.01 且比赛已结束时按结算处理
+
+
+def gamma_event_finished(slug):
+    """Gamma 事件是否已结束（供近结算价结算用）。
+    实测字段（2026-11-16）：已结束事件 ended=True、finishedTimestamp 已填、
+    live=False 且 score 为终场比分、period='FT'；未开始事件 live=None、
+    score=None、period='NS'；进行中 live=True。
+    注意：主市场 closed 长期=False（直到官方结算才变），不能单靠它判断，
+    只作为兜底——本场市场 closed=True 也算结束。
+    取不到事件 / 无 slug 时返回 False（不猜，宁可不结，下一轮重试）。"""
+    if not slug:
+        return False
+    try:
+        ev = get_json(f"{GAMMA}/events/slug/{slug}", timeout=10)
+    except Exception as e:
+        log(f"  Gamma 事件状态失败 slug={slug}: {e}")
+        return False
+    if not ev:
+        return False
+    if ev.get("ended") is True or ev.get("finishedTimestamp"):
+        return True
+    score = (ev.get("score") or "").strip()
+    if ev.get("live") is False and score:
+        return True
+    for m in ev.get("markets", []) or []:
+        if m.get("slug") == slug and m.get("closed"):
+            return True
+    return False
+
+
+def is_settle_price(last_price, slug=None):
+    """是否可结算价：
+    - 恰好 0.0/1.0：直接结算（老规则，不查事件）。
+    - 近结算（>=0.99/<=0.01）：只有 Gamma 事件确认已结束才结算；
+      进行中（赛点 0.995 只是现价高）或未开始的比赛不结——它们走
+      卖出触发（反转/概率/跌价），不走结算。"""
+    if last_price is None:
+        return False
+    if last_price in (0.0, 1.0):
+        return True
+    if last_price >= SETTLE_NEAR or last_price <= 1 - SETTLE_NEAR:
+        return bool(slug) and gamma_event_finished(slug)
+    return False
+
+
 def settle_one(st, token):
     pos = st["positions"].get(str(token))
     if not pos or pos.get("target") != SELF_TARGET:
@@ -618,7 +664,7 @@ def settle_one(st, token):
             continue
         last_price, last_ts = p, ts
         break
-    if last_price is None or last_price not in (0.0, 1.0):
+    if not is_settle_price(last_price, pos.get("slug")):
         return None
     if last_ts and now - last_ts < SETTLE_MIN_AGE:
         return None
@@ -929,7 +975,8 @@ def check_position(st, token, pos):
     顺序：(d) 结算价 -> (a) 反转 / (c) 概率（只看比分，不需要现价也能判断；
     取不到现价时卖出执行会失败、下一轮重试）-> (b) 现价暴跌。"""
     entry = float(pos.get("entry_price") or 0)
-    # (d) 先看结算：最后价恰好 0/1 且 >= 5 分钟前
+    # (d) 先看结算：最后价恰好 0/1，或近结算价（>=0.99/<=0.01）且比赛已结束，
+    # 且最后一笔 >= 5 分钟前
     now = int(time.time())
     last_price, last_ts = None, 0
     for window in (900, 86400, 604800):
@@ -938,7 +985,7 @@ def check_position(st, token, pos):
             continue
         last_price, last_ts = p, ts
         break
-    if last_price in (0.0, 1.0):
+    if is_settle_price(last_price, pos.get("slug")):
         if not last_ts or now - last_ts >= SETTLE_MIN_AGE:
             return "settle", "市场已结算", f"结算价 {last_price}"
         return None, "", f"结算价 {last_price} 但最后一笔成交 < 5 分钟，等下一轮"
