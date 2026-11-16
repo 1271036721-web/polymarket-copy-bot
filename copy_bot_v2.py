@@ -41,7 +41,7 @@ v2 的三层结构：
 依赖：pip install -r requirements.txt   # v2 新增 websocket-client
 实盘 SDK：pip install polymarket（与 v1 相同，dry_run=true 时用不到）
 """
-import argparse, csv, json, os, queue, sys, threading, time
+import argparse, csv, fcntl, json, os, queue, sys, threading, time
 from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timezone
 from pathlib import Path
@@ -98,6 +98,13 @@ class Bot:
         self.settled_file = BASE / "settled_trades.csv"
         self.dry_run = dry_run
         self.state = self.load_state()
+        # 保存时快照：save_state() 合并磁盘状态时用“机器人自己上次保存以来的
+        # 变化量”（内存值 - 上次保存时的内存值）去叠加磁盘值，避免覆盖模拟盘
+        # CLI（sim_trade.py）在机器人运行期间写入的 V7-SELF 持仓/现金变化。
+        # 2026-11-16 Dylan 决定：体育推单同步进 $8,000 模拟盘自营买卖。
+        self._cash_at_last_save = float(self.state.get("cash", 0.0))
+        self._trades_at_last_save = int(self.state.get("trades", 0))
+        self._sells_at_last_save = int(self.state.get("sells", 0))
         # 事件队列：WS 线程只往里放，主线程统一处理 state（避免多线程写 state）
         self.events = queue.Queue()
         # CLOB 线程的订阅请求队列
@@ -122,9 +129,67 @@ class Bot:
         return {"cash": CFG["capital_usd"], "positions": {}, "seen_tx": [], "trades": 0}
 
     def save_state(self):
+        """写 state.json。机器人只在内存里持有状态，而模拟盘 CLI
+        （sim_trade.py）会直接往磁盘 state.json 里写 V7-SELF 持仓，所以
+        保存时必须先把磁盘状态合并进来，否则一次机器人保存就会把 CLI
+        的持仓/现金变化整个覆盖掉（2026-11-16 自查发现的风险；当时
+        targets 为空，机器人只在退出时保存，风险是真实存在的）。
+        合并规则（持 fcntl 独占锁，CLI 用同一把锁）：
+          - 现金/笔数：磁盘值 +（内存值 - 上次保存时的内存值）= 机器人自己
+            这轮的变化量；写盘后才更新“上次保存”快照，所以重复保存是幂等的
+          - 持仓：机器人内存为准，但 target == "V7-SELF" 的仓位以磁盘为准
+            （CLI 在磁盘上买入/卖出/结算，机器人内存里可能是旧快照）
+          - seen_tx：两者并集，留最后 5000 条
+        合并结果写进一个新 dict，不动内存状态；任何异常都回退到直接写内存
+        状态，绝不能因为合并失败丢了保存。"""
         s = self.state
-        s["seen_tx"] = s["seen_tx"][-5000:]
-        self.state_file.write_text(json.dumps(s, indent=2))
+        try:
+            with open(self.state_file, "r+", encoding="utf-8") as f:
+                fcntl.flock(f, fcntl.LOCK_EX)
+                try:
+                    f.seek(0)
+                    disk = json.loads(f.read() or "{}")
+                except Exception:
+                    disk = {}
+                out = dict(s)
+                out["seen_tx"] = list(s.get("seen_tx", []))[-5000:]
+                if disk:
+                    out["cash"] = float(disk.get("cash", s["cash"])) + (
+                        float(s.get("cash", 0.0)) - self._cash_at_last_save
+                    )
+                    out["trades"] = int(disk.get("trades", 0)) + (
+                        int(s.get("trades", 0)) - self._trades_at_last_save
+                    )
+                    out["sells"] = int(disk.get("sells", 0)) + (
+                        int(s.get("sells", 0)) - self._sells_at_last_save
+                    )
+                    merged = dict(s.get("positions", {}) or {})
+                    disk_pos = disk.get("positions", {}) or {}
+                    for tok in list(merged.keys()):
+                        if merged[tok].get("target") == "V7-SELF" and tok not in disk_pos:
+                            del merged[tok]  # CLI 已在磁盘上卖出/结算了这笔
+                    for tok, pos in disk_pos.items():
+                        if isinstance(pos, dict) and pos.get("target") == "V7-SELF":
+                            merged[tok] = pos  # 磁盘是模拟盘仓位的唯一真相
+                    out["positions"] = merged
+                    seen = list(dict.fromkeys(
+                        list(out["seen_tx"]) + list(disk.get("seen_tx", []))))
+                    out["seen_tx"] = seen[-5000:]
+                f.seek(0)
+                f.truncate()
+                f.write(json.dumps(out, indent=2))
+                f.flush()
+                os.fsync(f.fileno())
+                fcntl.flock(f, fcntl.LOCK_UN)
+            self._cash_at_last_save = float(s.get("cash", 0.0))
+            self._trades_at_last_save = int(s.get("trades", 0))
+            self._sells_at_last_save = int(s.get("sells", 0))
+        except Exception as e:
+            log(f"  save_state 合并写失败（{e}），回退直接写内存状态")
+            self.state_file.write_text(json.dumps(s, indent=2))
+            self._cash_at_last_save = float(s.get("cash", 0.0))
+            self._trades_at_last_save = int(s.get("trades", 0))
+            self._sells_at_last_save = int(s.get("sells", 0))
 
     def append_log(self, row):
         exists = self.log_file.exists()
@@ -687,6 +752,8 @@ class Bot:
             if token in pending_tokens:
                 continue
             pos = positions[token]
+            if pos.get("target") == "V7-SELF":
+                continue  # 模拟盘自营仓位归 sim_trade.py 的 exit-check 管结算，机器人不碰
             last_price = None
             last_ts = 0
             for window in (900, 86400, 604800):
