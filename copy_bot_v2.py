@@ -284,6 +284,8 @@ class Bot:
         if not tx or tx in self.state["seen_tx"]:
             return False
         self.state["seen_tx"].append(tx)
+        if not CFG.get("follow_enabled", True):
+            return True  # 2026-11-16 Dylan 决定全部停跟单：只记 seen，不跟买入也不跟卖出
         if act.get("side") == "SELL":
             # 跟卖（2026-11-15 Dylan 决定）：目标卖出时按相同比例卖出我们持有的
             # 对应仓位（只减该目标名下的份额），不再死扛到结算。
@@ -580,6 +582,13 @@ class Bot:
 
     # ---------- 处理待处理池（v1 run_once 第 2 步） ----------
     def process_pending(self):
+        if not CFG.get("follow_enabled", True):
+            # 2026-11-16 Dylan 决定全部停跟单：清空待处理池，不执行任何跟单
+            n = len(self.state.get("pending", {}))
+            if n:
+                self.state["pending"] = {}
+                log(f"跟单已暂停：清空 {n} 组待处理，不跟单")
+            return 0
         new = 0
         self.state.setdefault("pending", {})
         now_ts = int(time.time())
@@ -815,14 +824,20 @@ class Bot:
             return
         backoff = 1
         while not self.stop.is_set():
+            # 待订阅 token：已有持仓 + 待处理池（买入路径也会直接加进来）
+            for tok in list(self.state.get("positions", {}).keys()):
+                self.subscribed_tokens.add(tok)
+            for p in self.state.get("pending", {}).values():
+                self.subscribed_tokens.add(str(p["token_id"]))
+            if not self.subscribed_tokens:
+                # 2026-11-16 清空后无持仓：空订阅会被服务端立即断开，
+                # 原地是 3 秒一次的重连循环；这里空闲等 5 秒，有新 token
+                # 时买入路径加进 subscribed_tokens，5 秒内就能接上。
+                self.stop.wait(5)
+                continue
             try:
                 ws = websocket.create_connection(CLOB_WS_URL, timeout=15)
                 log("CLOB WS: 已连接 wss://ws-subscriptions-clob.polymarket.com/ws/market")
-                # 初始订阅：已有持仓 + 待处理池的 token
-                for tok in list(self.state.get("positions", {}).keys()):
-                    self.subscribed_tokens.add(tok)
-                for p in self.state.get("pending", {}).values():
-                    self.subscribed_tokens.add(str(p["token_id"]))
                 if self.subscribed_tokens:
                     ws.send(json.dumps({"assets_ids": sorted(self.subscribed_tokens), "type": "market"}))
                     log(f"CLOB WS: 已订阅 {len(self.subscribed_tokens)} 个 token 的现价")
@@ -913,6 +928,8 @@ class Bot:
             log("⚠️ 实盘模式：会真花钱。确认 .env 已配好、私钥不在代码里。")
         s = self.state
         log(f"当前现金 ${s['cash']:.0f} 持仓 {len(s['positions'])} 个 已跟 {s['trades']} 笔 已见交易 {len(s['seen_tx'])} 条 待处理 {len(s.get('pending', {}))} 组")
+        if not CFG.get("follow_enabled", True):
+            log("⏸️ 跟单已暂停（follow_enabled=false）：不跟任何新单（买入/卖出），只做自动结算；恢复把 config.yaml 的 follow_enabled 改回 true 并重启")
         # 启动时先扫一轮结算：重启间隔里出结果的仓位立刻结算、释放上限
         try:
             self.settle_positions()
