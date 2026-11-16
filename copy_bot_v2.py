@@ -74,6 +74,7 @@ SAFETY_POLL_SECONDS = CFG.get("v2_safety_poll_seconds", 15)  # 兜底并行轮�
 PRICE_CACHE_MAX_AGE = CFG.get("v2_price_cache_max_age", 10)  # 现价缓存新鲜度（秒）
 SETTLE_INTERVAL_SECONDS = CFG.get("v2_settle_interval_seconds", 600)  # 自动结算间隔（秒）
 SETTLE_MIN_AGE_SECONDS = CFG.get("v2_settle_min_age_seconds", 300)  # 结算价至少 5 分钟前才认，避免瞬时坏价
+RTDS_SILENCE_LIMIT = CFG.get("rtds_silence_limit", 60)  # RTDS 心跳：超过这么多秒没收到服务端任何消息（含 PONG）就主动断开重连（2026-11-16 Dylan 选“两个都做”；此前只靠 watchdog 断流检测，盲区约 5 分钟）
 
 # V7 严格门槛（2026-11-16 Dylan 决定：用升级后 V7 严格过滤；赔率窗从 1.15–2.50 收紧到框架的 1.30–1.80）
 # 只拦 BUY，不拦 SELL（V7 是买入模型；卖出有 sell_price 校验）。
@@ -834,7 +835,16 @@ class Bot:
                 backoff = 1
                 self.backfill_needed.set()  # （重）连上先补漏一次
                 last_ping = 0.0
+                last_msg = time.time()  # 心跳：最后收到服务端任何消息（含 PONG）的时间
                 while not self.stop.is_set():
+                    # 心跳：超过 RTDS_SILENCE_LIMIT 秒没收到任何消息（含 PONG 回复）=
+                    # 连接半开死了：recv() 只会一直超时、send("PING") 也不报错，
+                    # 循环自己永远发现不了；这里主动断开走外层重连。
+                    # 正常时全量推送每秒几十条、PONG 每 5 秒回一次，60 秒没消息
+                    # 一定是死了，不会误判（2026-11-16 Dylan 选“两个都做”）。
+                    if time.time() - last_msg > RTDS_SILENCE_LIMIT:
+                        log(f"RTDS: {RTDS_SILENCE_LIMIT}s 无数据，主动断开重连")
+                        break
                     if time.time() - last_ping > 5:
                         try:
                             ws.send("PING")
@@ -848,6 +858,7 @@ class Bot:
                         continue
                     except Exception:
                         break
+                    last_msg = time.time()  # 收到任何消息都算活着（含 PONG）
                     if raw in ("PONG", "pong"):
                         continue
                     self.stats["rtds_msgs"] += 1
