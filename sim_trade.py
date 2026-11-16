@@ -37,6 +37,12 @@ V7 门槛、观察打分）永远不碰它们；机器人 settle_positions() 会
   (c) U1：取不到实时可成交价（CLOB book 与 Gamma 都无 ask）就不买。
   买入只用实时报价（CLOB book bestAsk -> Gamma bestAsk/outcomePrices），
   绝不用 prices-history 上一笔成交价兜底；原来固定的 $0.03 跑价保护已删除。
+  (d) 买入价必须新鲜（2026-11-16 19:42 事故后新增：Nardi/Latinovic 一单
+      因 Gamma 快照过期被骗，0.5005 买入、真价 0.58-0.675，亏 $50.93 后作废）：
+      Gamma 快照 updatedAt 超 10 分钟、两次取价跳变 > 0.03、/markets 与
+      /events 两个端点价差 > 0.03、现价与 V7 评估价偏离 > 0.05，任一成立
+      就拒单。实测：直播市场 updatedAt 也会滞后 2-4 分钟，60 秒阈值会误杀
+      正常买入，故时效阈值放宽到 10 分钟，主防线是评估价偏离校验。
   卖出不受影响：卖出永远不跳过，取不到价仍用 prices-history 兜底。
 
 退出触发（exit-check）：
@@ -90,6 +96,12 @@ MAX_OPEN = 3              # 最多 3 个未结算模拟仓位
 MAX_PER_GAME = 2          # 同一场比赛最多 2 个仓位
 MIN_PRICE, MAX_PRICE = 0.03, 0.97
 PRICE_DROP_SELL = 0.15    # (b) 现价比入场价低 0.15 就卖
+# --- 买入价新鲜校验（2026-11-16 19:42 Nardi 事故后新增，见 fresh_gamma_ask） ---
+FRESH_MAX_AGE_S = 600       # Gamma 快照 updatedAt 超过 10 分钟视为过期
+FRESH_JUMP_TOL = 0.03       # 两次取价相差超过 0.03 视为价格跳变
+FRESH_RECHECK_DELAY_S = 2.0  # 两次取价间隔（秒）
+FRESH_EVENT_TOL = 0.03      # /markets 与 /events 同一市场价差超过 0.03 视为数据不一致
+EVAL_DIVERGE_TOL = 0.05     # 买入现价与 V7 评估价（--price）偏离超过 0.05，评估已过期
 KELLY_MAX = 0.25          # Quarter Kelly  fraction 合理上限，防单位传错（如传 14 而不是 0.14）
 SETTLE_MIN_AGE = 300      # 结算价至少 5 分钟前才认（与机器人同款）
 LOCK_TIMEOUT = 15.0
@@ -240,6 +252,58 @@ def history_last_price(token_id, window=900):
     return None, 0
 
 
+def _parse_updated_at(value):
+    try:
+        if not value:
+            return None
+        return datetime.fromisoformat(str(value).replace("Z", "+00:00"))
+    except Exception:
+        return None
+
+
+def gamma_market_snapshot(slug):
+    """GET /markets?slug=，返回市场 dict；取不到返回 None。"""
+    try:
+        ms = get_json(f"{GAMMA}/markets?slug={slug}", timeout=10)
+        if ms:
+            return ms[0]
+    except Exception as e:
+        log(f"  Gamma 取价失败 slug={slug}: {e}")
+    return None
+
+
+def gamma_snapshot_price(market, outcome_index):
+    """从一个市场快照里取本边的价（与 gamma_best_ask 同款取边规则：
+    outcome 0 用 bestAsk，其余边用 outcomePrices[idx]；bestAsk 是
+    市场级字段，只属于 outcome 0）。取不到返回 None。"""
+    if not market:
+        return None
+    idx = int(outcome_index)
+    if idx == 0:
+        ba = market.get("bestAsk")
+        if ba is not None:
+            return float(ba)
+    try:
+        prices = json.loads(market.get("outcomePrices") or "[]")
+        return float(prices[idx])
+    except Exception:
+        return None
+
+
+def gamma_event_price(slug, outcome_index):
+    """GET /events/slug/<slug>，取嵌套 market 里本边的 outcomePrices 价。
+    与 /markets 端点交叉验证用；取不到返回 None（只少一层校验，不阻塞）。"""
+    try:
+        ev = get_json(f"{GAMMA}/events/slug/{slug}", timeout=10)
+        for m in ev.get("markets", []) or []:
+            if m.get("slug") == slug:
+                prices = json.loads(m.get("outcomePrices") or "[]")
+                return float(prices[int(outcome_index)])
+    except Exception as e:
+        log(f"  Gamma event 取价失败 slug={slug}: {e}")
+    return None
+
+
 def gamma_best_ask(slug, outcome_index):
     """Gamma 实时可成交价。注意：Gamma /markets 返回的 bestAsk/bestBid
     是市场级字段，只属于 outcome 0（实测：Magic vs. Celtics 一场，
@@ -252,21 +316,82 @@ def gamma_best_ask(slug, outcome_index):
     多市场盯价在 outcome_index=1 时读到对面的价——盯价曾因此误触发
     三场。CLOB /book、/price、/midpoint 目前对所有 token 都返回
     "Invalid token id"，Gamma 是唯一可用的取价源。）
+    注意：买入不用它，买入走 fresh_gamma_ask（带新鲜校验）。
     """
-    try:
-        ms = get_json(f"{GAMMA}/markets?slug={slug}", timeout=10)
-        if ms:
-            m = ms[0]
-            idx = int(outcome_index)
-            if idx == 0:
-                ba = m.get("bestAsk")
-                if ba is not None:
-                    return float(ba)
-            prices = json.loads(m.get("outcomePrices") or "[]")
-            return float(prices[idx])
-    except Exception as e:
-        log(f"  Gamma 取价失败 slug={slug}: {e}")
-    return None
+    return gamma_snapshot_price(gamma_market_snapshot(slug), outcome_index)
+
+
+def fresh_gamma_ask(slug, outcome_index, delay=FRESH_RECHECK_DELAY_S):
+    """买入用 Gamma 新鲜价（2026-11-16 19:42 事故后新增）。
+    只取一次快照会被过期缓存骗过：Nardi/Latinovic 一单买入时快照价
+    0.5005，真价 0.58-0.675，买入价是假的，亏 $50.93 后整笔作废。
+    四层校验，任一不过返回 (None, 原因)，只在全部通过时返回
+    (price, 'gamma-fresh')，price 取第二次读取（最新的一次）：
+    (1) 快照 updatedAt 超过 FRESH_MAX_AGE_S（10 分钟）-> 过期；
+        注意实测：直播市场 updatedAt 也会滞后 2-4 分钟，60 秒阈值会
+        误杀正常买入（如 Hemery 一单买入时已滞后 107 秒），故放宽到 10 分钟；
+        updatedAt 缺失/解析失败时记一条日志，跳过本层（不阻塞）。
+    (2) 隔 delay 秒再取一次，两次价差 > FRESH_JUMP_TOL（0.03）-> 价格跳变；
+    (3) /events 端点同市场价与第二次价差 > FRESH_EVENT_TOL（0.03）
+        -> 两个端点数据不一致。
+    """
+    m1 = gamma_market_snapshot(slug)
+    p1 = gamma_snapshot_price(m1, outcome_index)
+    if p1 is None:
+        return None, "gamma-none"
+    ua = _parse_updated_at(m1.get("updatedAt")) if m1 else None
+    if ua is not None:
+        age = (datetime.now(timezone.utc) - ua).total_seconds()
+        if age > FRESH_MAX_AGE_S:
+            log(f"  取价：Gamma 快照 updatedAt 已 {age:.0f}s（>{FRESH_MAX_AGE_S}s），过期不买")
+            return None, "gamma-stale"
+    else:
+        log("  取价：Gamma 快照无 updatedAt，跳过时效校验")
+    time.sleep(delay)
+    m2 = gamma_market_snapshot(slug)
+    p2 = gamma_snapshot_price(m2, outcome_index)
+    if p2 is None:
+        return None, "gamma-none"
+    if abs(p2 - p1) > FRESH_JUMP_TOL:
+        log(f"  取价：Gamma 两次取价 ${p1:.3f} -> ${p2:.3f}，跳变 > {FRESH_JUMP_TOL}，不买")
+        return None, "gamma-jump"
+    ev = gamma_event_price(slug, outcome_index)
+    if ev is not None and abs(ev - p2) > FRESH_EVENT_TOL:
+        log(f"  取价：Gamma /markets ${p2:.3f} 与 /events ${ev:.3f} 不一致 > {FRESH_EVENT_TOL}，不买")
+        return None, "gamma-mismatch"
+    return p2, "gamma-fresh"
+
+
+def fresh_ask_price(token_id, slug="", outcome_index=None, eval_price=None,
+                    delay=FRESH_RECHECK_DELAY_S):
+    """买入用新鲜可成交价：CLOB book 为主（目前恒失败，返回 Invalid token id），
+    Gamma 走 fresh_gamma_ask 四层新鲜校验；再与 V7 评估价（--price）比对，
+    偏离 > EVAL_DIVERGE_TOL（0.05）说明评估时的价格已过期——Nardi 一单：
+    评估 0.5835，买入快照 0.5005，偏离 0.083，本应拒单。返回 (price, source)
+    或 (None, 原因)。这是买入侧的“价格跑掉”检查，与推送侧的复核同款逻辑，
+    只是在执行前就拦住，不用等推送复核才发现（原来流程是先买后复核）。"""
+    ask = clob_ask(token_id)
+    g, gsrc = None, None
+    if slug and outcome_index is not None:
+        g, gsrc = fresh_gamma_ask(slug, outcome_index, delay=delay)
+        if g is None:
+            # Gamma 新鲜校验不过：CLOB 即便有价也不可单独信（CLOB 偶尔卡
+            # $0.99 假价，且 Gamma 是唯一能交叉验证的源），直接拒单。
+            return None, gsrc
+    if ask is not None and g is not None and abs(ask - g) > 0.10:
+        log(f"  取价：CLOB ask ${ask:.3f} 与 Gamma ${g:.3f} 偏离 > 0.10，改用 Gamma")
+        ask, src = g, "gamma-fresh"
+    elif ask is not None:
+        src = "clob"
+    elif g is not None:
+        ask, src = g, "gamma-fresh"
+    else:
+        return None, "none"
+    if eval_price is not None and abs(ask - float(eval_price)) > EVAL_DIVERGE_TOL:
+        log(f"  取价：现价 ${ask:.3f} 与 V7 评估价 ${float(eval_price):.3f} "
+            f"偏离 > {EVAL_DIVERGE_TOL}，评估已过期，不买")
+        return None, "eval-diverged"
+    return ask, src
 
 
 def live_ask_price(token_id, slug="", outcome_index=None):
@@ -365,10 +490,13 @@ def cmd_buy(a):
     if cap is None or not (0 < cap < 1):
         return fail("未传有效的 --no-chase-cap（分析反转条件里的不再追上限），无 V7 价格保护，拒绝买入")
     # 买前重新取实时可成交价，按 V7 价格保护：(a) 不高于本单的不再追上限；
-    # (b) U2：按现价算 Edge > 0；(c) U1：取不到实时可成交价就不买。
-    ask, src = live_ask_price(token, a.slug, a.outcome_index)
+    # (b) U2：按现价算 Edge > 0；(c) U1：取不到实时可成交价就不买；
+    # (d) 新鲜校验（2026-11-16 19:42 事故后新增）：Gamma 快照过期/跳变/
+    #     端点不一致/与 V7 评估价偏离 > 0.05 都拒单——这就是推送侧“价格跑掉
+    #     不推”在执行前的版本，原来先买后复核的顺序漏洞就堵在这里。
+    ask, src = fresh_ask_price(token, a.slug, a.outcome_index, eval_price=a.price)
     if ask is None:
-        return fail("无实时可成交价（CLOB book 与 Gamma 都取不到 ask），按 U1 不买")
+        return fail(f"买入价校验不过（{src}），按 U1 不买")
     if ask > cap:
         return fail(f"现价 ${ask:.3f}（{src}）高于不再追上限 ${cap:.3f}，按 V7 不买")
     if a.prob_low - ask <= 0:
