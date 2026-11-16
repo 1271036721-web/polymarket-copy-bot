@@ -19,6 +19,7 @@ V7 门槛、观察打分）永远不碰它们；机器人 settle_positions() 会
   buy:  python3 sim_trade.py buy --analysis-id 41 --token-id 123... \
           --slug nfl-bal-lac-2026-11-16 --title "Ravens vs Chargers" \
           --outcome "Ravens" --outcome-side yes --price 0.65 --prob-low 0.72 \
+          --no-chase-cap 0.76 \
           --kelly-frac 0.14 --sport football --market-type 胜负 --phase 盘前 \
           --polymarket-url https://polymarket.com/event/... \
           --reversal "乌鸦落后则作废" --rev-team Ravens --rev-trailing \
@@ -27,6 +28,16 @@ V7 门槛、观察打分）永远不碰它们；机器人 settle_positions() 会
   settle: python3 sim_trade.py settle
   status: python3 sim_trade.py status
   exit-check: python3 sim_trade.py exit-check   # 退出监控：每 2 分钟跑一次
+
+买入价格保护（V7 系统，Dylan 2026-11-16 15:31 决定：价格保护根据 V7 分析系统来）：
+  (a) 每单的不再追上限：买入价不得高于本单分析反转条件里的上限
+      （如猛龙 0.76、维京人 0.70、美洲虎 0.75、火箭 0.80），高于就拒单；
+      不传 --no-chase-cap 就拒单——没有上限等于没有 V7 价格保护。
+  (b) U2：按实时可成交价算 Conservative Edge > 0，否则拒单。
+  (c) U1：取不到实时可成交价（CLOB book 与 Gamma 都无 ask）就不买。
+  买入只用实时报价（CLOB book bestAsk -> Gamma bestAsk/outcomePrices），
+  绝不用 prices-history 上一笔成交价兜底；原来固定的 $0.03 跑价保护已删除。
+  卖出不受影响：卖出永远不跳过，取不到价仍用 prices-history 兜底。
 
 退出触发（exit-check）：
   (a) 分析自带的反转条件触发（结构化参数 --rev-lead-min / --rev-trailing，
@@ -78,7 +89,6 @@ PER_TOKEN_CAP = 150.0     # 同一 token 累计成本上限 $150
 MAX_OPEN = 3              # 最多 3 个未结算模拟仓位
 MAX_PER_GAME = 2          # 同一场比赛最多 2 个仓位
 MIN_PRICE, MAX_PRICE = 0.03, 0.97
-PRICE_RUN_TOL = 0.03      # 买入时现价与复核价偏差超过 3 美分就拒单（价跑了）
 PRICE_DROP_SELL = 0.15    # (b) 现价比入场价低 0.15 就卖
 KELLY_MAX = 0.25          # Quarter Kelly  fraction 合理上限，防单位传错（如传 14 而不是 0.14）
 SETTLE_MIN_AGE = 300      # 结算价至少 5 分钟前才认（与机器人同款）
@@ -230,10 +240,46 @@ def history_last_price(token_id, window=900):
     return None, 0
 
 
+def gamma_best_ask(slug, outcome_index):
+    """Gamma 实时可成交价：bestAsk 为主，取不到用 outcomePrices。取不到返回 None。"""
+    try:
+        ms = get_json(f"{GAMMA}/markets?slug={slug}", timeout=10)
+        if ms:
+            m = ms[0]
+            ba = m.get("bestAsk")
+            if ba is not None:
+                return float(ba)
+            prices = json.loads(m.get("outcomePrices") or "[]")
+            return float(prices[int(outcome_index)])
+    except Exception as e:
+        log(f"  Gamma 取价失败 slug={slug}: {e}")
+    return None
+
+
+def live_ask_price(token_id, slug="", outcome_index=None):
+    """买入用实时可成交价（V7 U1）：CLOB book bestAsk 为主；
+    与 Gamma 偏离 > 0.10 时视为假价（CLOB 偶尔卡 $0.99，跟单机器人已中招两次）
+    改用 Gamma；两者都没有 -> (None, 'none')。
+    绝不用 prices-history：上一笔成交价不是实时可成交报价。"""
+    ask = clob_ask(token_id)
+    g = None
+    if slug and outcome_index is not None:
+        g = gamma_best_ask(slug, outcome_index)
+    if ask is not None and g is not None and abs(ask - g) > 0.10:
+        log(f"  取价：CLOB ask ${ask:.3f} 与 Gamma ${g:.3f} 偏离 > 0.10，改用 Gamma")
+        return g, "gamma"
+    if ask is not None:
+        return ask, "clob"
+    if g is not None:
+        return g, "gamma"
+    return None, "none"
+
+
 def validated_price(token_id, slug="", outcome_index=None):
-    """卖出/买入用的校验价：CLOB ask 为主；与 prices-history 偏离 > 0.10
+    """卖出用的校验价：CLOB ask 为主；与 prices-history 偏离 > 0.10
     就不可信（CLOB WS/Book 偶尔卡 $0.99 假价，跟单机器人 2026-11-15
-    已中招两次），改用 prices-history；再取不到用 Gamma。返回 (price, source)。"""
+    已中招两次），改用 prices-history；再取不到用 Gamma。返回 (price, source)。
+    买入不用它（买入走 live_ask_price，绝不用历史价）。"""
     ask = clob_ask(token_id)
     hist, _ = history_last_price(token_id)
     if ask is not None and hist is not None and abs(ask - hist) > 0.10:
@@ -302,12 +348,16 @@ def cmd_buy(a):
         return fail(f"复核价 ${a.price:.3f} 超出 [{MIN_PRICE}-{MAX_PRICE}]，拒绝")
     if not (0 < a.prob_low < 1):
         return fail(f"prob-low {a.prob_low} 非 (0,1)，拒绝")
-    # 买前重新取现价：价跑了（与复核价偏差 > 3 美分）或 Edge 已 <= 0 就不买
-    ask, src = validated_price(token, a.slug, a.outcome_index)
+    cap = getattr(a, "no_chase_cap", None)
+    if cap is None or not (0 < cap < 1):
+        return fail("未传有效的 --no-chase-cap（分析反转条件里的不再追上限），无 V7 价格保护，拒绝买入")
+    # 买前重新取实时可成交价，按 V7 价格保护：(a) 不高于本单的不再追上限；
+    # (b) U2：按现价算 Edge > 0；(c) U1：取不到实时可成交价就不买。
+    ask, src = live_ask_price(token, a.slug, a.outcome_index)
     if ask is None:
-        return fail("取不到现价，拒绝买入（不按 stale 价成交）")
-    if abs(ask - a.price) > PRICE_RUN_TOL:
-        return fail(f"现价 ${ask:.3f}（{src}）与复核价 ${a.price:.3f} 偏差 > ${PRICE_RUN_TOL}，价跑了不买")
+        return fail("无实时可成交价（CLOB book 与 Gamma 都取不到 ask），按 U1 不买")
+    if ask > cap:
+        return fail(f"现价 ${ask:.3f}（{src}）高于不再追上限 ${cap:.3f}，按 V7 不买")
     if a.prob_low - ask <= 0:
         return fail(f"按现价 ${ask:.3f} 算 Edge = {a.prob_low:.3f}-{ask:.3f} <= 0，不买")
     with LockedState(a.state_file) as st:
@@ -338,7 +388,7 @@ def cmd_buy(a):
             "phase": a.phase, "entry_price": round(ask, 4),
             "entry_time_utc": datetime.now(timezone.utc).isoformat(),
             "prob_low": a.prob_low, "kelly_frac": a.kelly_frac,
-            "stake_usd": round(stake, 2), "reversal": a.reversal or "",
+            "no_chase_cap": cap, "stake_usd": round(stake, 2), "reversal": a.reversal or "",
             "rev_lead_min": a.rev_lead_min, "rev_trailing": bool(a.rev_trailing),
             "rev_team": a.rev_team or "",
             "espn_league": a.espn_league or "", "home_team": a.home_team or "",
@@ -840,6 +890,8 @@ def main():
     b.add_argument("--outcome-side", default="yes", choices=["yes", "no"])
     b.add_argument("--outcome-index", type=int, default=0)
     b.add_argument("--price", type=float, required=True, help="交付前复核的可执行价（Gamma bestAsk/CLOB ask）")
+    b.add_argument("--no-chase-cap", type=float, required=True,
+                   help="V7 价格保护：本单反转条件里的不再追上限（如 0.76），现价高于它就不买；不传就拒绝")
     b.add_argument("--prob-low", type=float, required=True, help="V7 独立概率区间下界（0-1）")
     b.add_argument("--kelly-frac", type=float, required=True, help="工具 Quarter Kelly（本金占比，如 0.14）")
     b.add_argument("--sport", default="")
