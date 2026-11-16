@@ -241,16 +241,29 @@ def history_last_price(token_id, window=900):
 
 
 def gamma_best_ask(slug, outcome_index):
-    """Gamma 实时可成交价：bestAsk 为主，取不到用 outcomePrices。取不到返回 None。"""
+    """Gamma 实时可成交价。注意：Gamma /markets 返回的 bestAsk/bestBid
+    是市场级字段，只属于 outcome 0（实测：Magic vs. Celtics 一场，
+    bestAsk 0.24 = Magic（outcome 0）的卖价，Celtics 是 outcome 1）。
+    所以 outcome_index == 0 时才用 bestAsk；outcome_index != 0 时
+    bestAsk 是另一边的价，绝不能用，改用 outcomePrices[ outcome_index ]
+    （同边的最新价）。取不到返回 None。
+
+    （2026-11-16 发现：旧实现不分边直接返回 bestAsk，导致买入校验和
+    多市场盯价在 outcome_index=1 时读到对面的价——盯价曾因此误触发
+    三场。CLOB /book、/price、/midpoint 目前对所有 token 都返回
+    "Invalid token id"，Gamma 是唯一可用的取价源。）
+    """
     try:
         ms = get_json(f"{GAMMA}/markets?slug={slug}", timeout=10)
         if ms:
             m = ms[0]
-            ba = m.get("bestAsk")
-            if ba is not None:
-                return float(ba)
+            idx = int(outcome_index)
+            if idx == 0:
+                ba = m.get("bestAsk")
+                if ba is not None:
+                    return float(ba)
             prices = json.loads(m.get("outcomePrices") or "[]")
-            return float(prices[int(outcome_index)])
+            return float(prices[idx])
     except Exception as e:
         log(f"  Gamma 取价失败 slug={slug}: {e}")
     return None
