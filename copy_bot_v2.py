@@ -23,7 +23,9 @@ v2 的三层结构：
   - 碎单聚合：按 (目标, token) 累计，折合 >= $5 或满 600 秒才处理一次
   - decide() 风控、2 美分滑点保护、市价跟单、dry_run 记账
   - V7 宽松门槛（2026-11-16 Dylan 决定）：赔率 1.15–2.50、U3 每天同类型
-    2 场、否决清单（v7_veto.json）；只拦 BUY，cannot_score 类型放行
+    2 场、否决清单（v7_veto.json）；只拦 BUY；电竞盘中全跳过
+    （2026-11-16 Dylan 决定停电竞盘中跟单：cannot_score 单局胜负及
+    所有电竞盘口都不跟）
   - seen_tx 去重（RTDS 和轮询走同一条 ingest，同一 tx 只处理一次）
   - 两个 WS 断线后指数退避重连，重连成功立即拉一次 activity 补漏
 
@@ -541,10 +543,14 @@ class Bot:
     def v7_gate(self, target_name, title, outcome, now):
         """宽松版 V7 门槛（只拦 BUY；SELL 不走这里）。
         返回 "" 表示放行，否则返回跳过原因（调用方记日志）。
-        顺序：否决清单 -> cannot_score 类型放行 -> 赔率窗 -> U3。
+        顺序：否决清单 -> 电竞盘中跳过 -> 赔率窗 -> U3。
         - 否决清单：(target, market_type) 在 v7_veto.json 里就拦。
-        - cannot_score：电竞盘中单局胜负（Dota 2 Game/Map N Winner 这类）
-          没有局内信息算不出概率，观察里记 cannot_score，这里直接放行。
+        - 电竞盘中：2026-11-16 Dylan 决定停电竞盘中跟单（已实现亏损
+          -$3,579 里电竞盘中单局占 -$2,517）。Dota 2 / CS2 / LoL /
+          Valorant / KPL 的盘口全跳过，不只单局胜负（Map 让分、
+          BO3 系列赛也一样是在盘中下的）；cannot_score 的单局胜负
+          （没有局内信息算不出概率）也在其中。赛前电竞系列赛如需
+          恢复跟单，再单独放开。
         - 赔率窗：隐含赔率 1/now 在 1.15–2.50 外就拦；只对 V7 能打分的
           运动生效（not_applicable 的非体育目标直接放行；标题没带运动
           关键词的 unknown_sport 仍走赔率窗——框架覆盖足球/篮球/UFC 等，
@@ -561,8 +567,8 @@ class Bot:
                 return f"V7 门槛：否决清单 {target_name}|{mt}（自 {v.get('since', '')}）-> 跳过"
         if kind == "not_applicable":
             return ""
-        if sport == "esports" and mt == "单局胜负":
-            return ""
+        if sport == "esports":
+            return f"V7 门槛：电竞盘中不跟（{sport_name or ''} {mt}）-> 跳过"
         if now and now > 0:
             odds = 1.0 / now
             if odds < V7_ODDS_LOW or odds > V7_ODDS_HIGH:
